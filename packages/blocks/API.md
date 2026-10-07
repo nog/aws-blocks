@@ -61,6 +61,9 @@ import { ConditionalDeleteOptions } from '@aws-blocks/bb-kv-store';
 import { ConditionalWriteOptions } from '@aws-blocks/bb-kv-store';
 import { ConfirmSignInOptions } from '@aws-blocks/bb-auth-cognito';
 import { CorsRule } from '@aws-blocks/bb-file-bucket';
+import { Counters } from '@aws-blocks/bb-counters';
+import { CountersErrors } from '@aws-blocks/bb-counters';
+import { CountersOptions } from '@aws-blocks/bb-counters';
 import { CronJob } from '@aws-blocks/bb-cron-job';
 import { CronJobErrors } from '@aws-blocks/bb-cron-job';
 import { CronJobEvent } from '@aws-blocks/bb-cron-job';
@@ -110,6 +113,7 @@ import { GetUrlOptions } from '@aws-blocks/bb-file-bucket';
 import { github } from '@aws-blocks/bb-auth-oidc';
 import { google } from '@aws-blocks/bb-auth-oidc';
 import { GroupAdmin } from '@aws-blocks/bb-auth-cognito';
+import { IncrementOptions } from '@aws-blocks/bb-counters';
 import { KnowledgeBase } from '@aws-blocks/bb-knowledge-base';
 import { KnowledgeBaseErrors } from '@aws-blocks/bb-knowledge-base';
 import { KnowledgeBaseOptions } from '@aws-blocks/bb-knowledge-base';
@@ -298,6 +302,12 @@ export { ConfirmSignInOptions }
 
 export { CorsRule }
 
+export { Counters }
+
+export { CountersErrors }
+
+export { CountersOptions }
+
 export { CronJob }
 
 export { CronJobErrors }
@@ -483,6 +493,8 @@ export { github }
 export { google }
 
 export { GroupAdmin }
+
+export { IncrementOptions }
 
 export { KnowledgeBase }
 

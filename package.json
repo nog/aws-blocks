@@ -60,7 +60,8 @@
     "test-apps/db-pull-typecheck",
     "scripts/agent-bench",
     "test-apps/telemetry",
-    "test-infra"
+    "test-infra",
+    "packages/bb-counters"
   ],
   "scripts": {
     "prepare": "husky && bash scripts/setup-git-secrets.sh",

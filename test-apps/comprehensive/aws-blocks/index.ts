@@ -4,7 +4,8 @@
 // Comprehensive test backend covering all Building Blocks
 // This is NOT a user-facing template - it's designed for maximum test coverage
 
-import { ApiNamespace, Scope, KVStore, AuthBasic, AuthCognito, AuthOIDC, google, stubIdp, relayOrigin, DistributedTable, Realtime, Database, CronJob, FileBucket, KnowledgeBase, sql, RawRoute, EmailClient } from '@aws-blocks/blocks';
+import { ApiNamespace, Scope, KVStore, AuthBasic, AuthCognito, AuthOIDC, google, stubIdp, relayOrigin, DistributedTable, Realtime, Database, CronJob, FileBucket, KnowledgeBase, sql, RawRoute, EmailClient, Counters } from '@aws-blocks/blocks';
+import type { IncrementOptions } from '@aws-blocks/blocks';
 export type { RealtimeChannel, DisconnectReason, SubscribeOptions } from '@aws-blocks/blocks';
 import type { EmailMessage } from '@aws-blocks/blocks';
 import type { ConditionalWriteOptions, ConditionalDeleteOptions } from '@aws-blocks/bb-kv-store';
@@ -59,6 +60,10 @@ function parseStoredRecord<T>(key: string, raw: string | null): T | null {
 
 // KVStore - Simple key-value storage
 const store = new KVStore(scope, 'store', {});
+
+// Counters - atomic, bounded integer counters (bounded so e2e can exercise
+// the min/max guard: at most 10, never below 0)
+const counters = new Counters(scope, 'counters', { min: 0, max: 10 });
 
 // KVStore<number> - Typed numeric store for generic type testing
 const numStore = new KVStore<number>(scope, 'num-store');
@@ -857,6 +862,36 @@ export const api = new ApiNamespace(scope, 'api', (context) => ({
     const entries: { key: string; value: string }[] = [];
     for await (const entry of store.scan()) entries.push(entry);
     return entries;
+  },
+
+  // ------------------------------------------------------------------------
+  // Counters Tests
+  // ------------------------------------------------------------------------
+
+  async counterIncrement(key: string, delta?: number, options?: IncrementOptions) {
+    return await counters.increment(key, delta, options);
+  },
+
+  async counterDecrement(key: string, delta?: number, options?: IncrementOptions) {
+    return await counters.decrement(key, delta, options);
+  },
+
+  async counterGet(key: string) {
+    return await counters.get(key);
+  },
+
+  async counterGetBatch(keys: string[]) {
+    return await counters.getBatch(keys);
+  },
+
+  async counterSet(key: string, value: number) {
+    await counters.set(key, value);
+    return { success: true };
+  },
+
+  async counterDelete(key: string) {
+    await counters.delete(key);
+    return { success: true };
   },
 
   // ------------------------------------------------------------------------

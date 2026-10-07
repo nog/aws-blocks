@@ -1,0 +1,59 @@
+{
+  "name": "@aws-blocks/bb-counters",
+  "version": "0.1.0",
+  "description": "Many named integer counters with atomic, retry-free increments and min/max bounds, backed by DynamoDB.",
+  "keywords": [
+    "aws-blocks",
+    "counter",
+    "dynamodb"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aws-devtools-labs/aws-blocks.git",
+    "directory": "packages/bb-counters"
+  },
+  "homepage": "https://github.com/aws-devtools-labs/aws-blocks/tree/main/packages/bb-counters#readme",
+  "bugs": {
+    "url": "https://github.com/aws-devtools-labs/aws-blocks/issues"
+  },
+  "author": "Amazon Web Services",
+  "license": "Apache-2.0",
+  "type": "module",
+  "files": [
+    "dist",
+    "README.md",
+    "DESIGN.md",
+    "src",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "browser": "./dist/index.browser.js",
+      "cdk": {
+        "types": "./dist/index.cdk.d.ts",
+        "default": "./dist/index.cdk.js"
+      },
+      "aws-runtime": "./dist/index.aws.js",
+      "types": "./dist/index.mock.d.ts",
+      "default": "./dist/index.mock.js"
+    }
+  },
+  "scripts": {
+    "prebuild": "node ../../scripts/generate-version.mjs Counters",
+    "build": "tsc --build",
+    "test": "node --test --test-concurrency=1 dist/*.test.js"
+  },
+  "dependencies": {
+    "@aws-blocks/core": "^0.6.0",
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0"
+  },
+  "peerDependencies": {
+    "aws-cdk-lib": "^2.257.0",
+    "constructs": "^10.6.0"
+  }
+}

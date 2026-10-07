@@ -11,6 +11,7 @@ import type { api as apiType } from 'aws-blocks';
 import { ApiError } from '@aws-blocks/core';
 import { installCookieJar } from './cookie-jar.js';
 import { kvStoreTests } from './kv-store.test.js';
+import { countersTests } from './counters.test.js';
 import { distributedTableTests } from './distributed-table.test.js';
 import { distributedTableSecureDefaultsTests } from './distributed-table-secure-defaults.test.js';
 import { realtimeTests } from './realtime.test.js';
@@ -216,6 +217,9 @@ test('Sanity check - API calls use HTTP not direct imports', { timeout: 10_000 }
 
 // KVStore tests (separate file)
 kvStoreTests(() => api);
+
+// Counters tests (separate file)
+countersTests(() => api);
 
 // DistributedTable tests (separate file)
 distributedTableTests(() => api);

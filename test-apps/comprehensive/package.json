@@ -45,7 +45,8 @@
     "@aws-blocks/bb-tracer": "*",
     "@aws-blocks/blocks": "*",
     "@aws-blocks/core": "*",
-    "zod": "^4.3.0"
+    "zod": "^4.3.0",
+    "@aws-blocks/bb-counters": "*"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
