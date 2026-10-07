@@ -371,7 +371,7 @@ If a method shows up with `unknown` types and you didn't expect it, check whethe
 
 This section is for native codegen authors and platform SDK authors. App developers don't need to read it — the extensions are emitted automatically based on what your `aws-blocks/index.ts` returns.
 
-Blocks uses two OpenRPC `x-` extension fields. All others in `blocks.spec.json` are standard OpenRPC 1.3.2.
+Blocks uses four OpenRPC `x-` extension fields: two on a method's result schema, and two at the document root. All others in `blocks.spec.json` are standard OpenRPC 1.3.2.
 
 ### `x-blocks-transferable` (on a method's `result.schema`)
 
@@ -418,6 +418,56 @@ Carries the JSON Schema for each generic type argument of the SDK type, in decla
 ```
 
 Each entry is a valid JSON Schema and may use `$ref` against `components.schemas`. For non-generic transferables (`file-bucket/download`, `file-bucket/upload` today), this field is omitted.
+
+### `x-blocks-native-packages` (document root)
+
+Declares the native package each platform needs, keyed by logical package identity. Each entry holds a `platforms` object whose `dart`, `swift`, and `android` fields are independently optional; a present field carries a `package` object naming the package-manager identity and the import or module name. No `package` field carries a version: the customer's own dependency declaration supplies it.
+
+```json
+{
+	"x-blocks-native-packages": {
+		"schemaVersion": 1,
+		"packages": {
+			"file-bucket-native": {
+				"platforms": {
+					"dart": { "package": { "name": "blocks_file_bucket", "library": "blocks_file_bucket.dart" } },
+					"swift": { "package": { "identity": "blocks-file-bucket", "product": "BlocksFileBucket", "module": "BlocksFileBucket" } },
+					"android": { "package": { "group": "com.aws.blocks.filebucket", "artifact": "native", "kotlinPackage": "com.aws.blocks.filebucket" } }
+				}
+			}
+		}
+	}
+}
+```
+
+**Codegen contract.** An absent platform field means the package is not offered there; that platform emits `UnknownTransferable` for the affected results while other platforms keep their typed bindings. A malformed present field is an error.
+
+### `x-blocks-native-bindings` (document root)
+
+Maps a transferable tag to the package export that implements it. Each binding carries a stable `id`, a `kind` (only `transferable` in schema 1), the exact `tag`, the `package` identity, the `export`, a factory `abi`, and a `genericArity` of 0 or 1.
+
+```json
+{
+	"x-blocks-native-bindings": {
+		"schemaVersion": 1,
+		"bindings": [
+			{
+				"id": "file-download",
+				"kind": "transferable",
+				"tag": "file-bucket/download",
+				"package": "file-bucket-native",
+				"export": "fileDownloadHandle",
+				"abi": "blocks-transferable-v1",
+				"genericArity": 0
+			}
+		]
+	}
+}
+```
+
+**Codegen contract.** A method joins its binding only by tag: `result.schema.x-blocks-transferable` equals `bindings[].tag`. The `abi` fixes the call: under `blocks-transferable-v1`, export `x` resolves to `X.fromBlocksDescriptor`. A built-in tag cannot be bound by a block.
+
+**Stability.** Both catalogs are emitted only when a block declares content, so a spec without declarations is unchanged from before they existed.
 
 ### What's not in the spec
 
