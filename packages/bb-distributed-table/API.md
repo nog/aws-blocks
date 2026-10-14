@@ -9,6 +9,22 @@ import { Scope } from '@aws-blocks/core';
 import type { ScopeParent } from '@aws-blocks/core';
 import type { StandardSchemaV1 } from '@standard-schema/spec';
 
+// @public
+export interface CounterBounds {
+    max?: number;
+    min?: number;
+}
+
+// @public
+export type CounterField<T, K extends TableKeyConfig<T>> = Exclude<NumericFields<T>, K['partitionKey'] | (K extends {
+    sortKey: infer SK;
+} ? SK : never)>;
+
+// @public
+export type CountersConfig<T, K extends TableKeyConfig<T>> = {
+    [P in CounterField<T, K>]?: CounterBounds;
+};
+
 // @public (undocumented)
 export type DeleteOptions<T> = {
     ifExists: true;
@@ -19,8 +35,8 @@ export type DeleteOptions<T> = {
 } | Record<string, never>;
 
 // @public (undocumented)
-export class DistributedTable<T, K extends TableKeyConfig<T> = TableKeyConfig<T>, Indexes extends Record<string, TableKeyConfig<T>> = Record<string, TableKeyConfig<T>>> extends Scope {
-    constructor(scope: ScopeParent, id: string, options: DistributedTableOptions<T, K, Indexes>);
+export class DistributedTable<T, K extends TableKeyConfig<T> = TableKeyConfig<T>, Indexes extends Record<string, TableKeyConfig<T>> = Record<string, TableKeyConfig<T>>, C extends CountersConfig<T, K> = Record<never, never>> extends Scope {
+    constructor(scope: ScopeParent, id: string, options: DistributedTableOptions<T, K, Indexes, C>);
     // (undocumented)
     readonly bbName = "DistributedTable";
     // (undocumented)
@@ -35,10 +51,11 @@ export class DistributedTable<T, K extends TableKeyConfig<T> = TableKeyConfig<T>
     get(key: TableKey<T, K>): Promise<T | null>;
     // (undocumented)
     getBatch(keys: TableKey<T, K>[]): Promise<(T | null)[]>;
+    increment(key: TableKey<T, K>, field: keyof C & CounterField<T, K>, options?: IncrementOptions): Promise<number>;
     // @internal
     protected log: ChildLogger;
     // (undocumented)
-    options: DistributedTableOptions<T, K, Indexes>;
+    options: DistributedTableOptions<T, K, Indexes, C>;
     // (undocumented)
     put(item: T, options?: PutOptions<T>): Promise<void>;
     // (undocumented)
@@ -55,10 +72,13 @@ export const DistributedTableErrors: {
     readonly InvalidQuery: "InvalidQueryException";
     readonly ItemTooLarge: "ItemTooLargeException";
     readonly BatchIncomplete: "BatchIncompleteException";
+    readonly ItemNotFound: "ItemNotFoundException";
+    readonly CounterOutOfRange: "CounterOutOfRangeException";
 };
 
 // @public (undocumented)
-export interface DistributedTableOptions<T, K extends TableKeyConfig<T> = TableKeyConfig<T>, Indexes extends Record<string, TableKeyConfig<T>> = Record<string, TableKeyConfig<T>>> {
+export interface DistributedTableOptions<T, K extends TableKeyConfig<T> = TableKeyConfig<T>, Indexes extends Record<string, TableKeyConfig<T>> = Record<string, TableKeyConfig<T>>, C extends CountersConfig<T, K> = Record<never, never>> {
+    counters?: ExactCounters<T, K, C>;
     encryption?: 'aws-managed' | 'customer-managed' | ExternalKmsKeyRef;
     indexes?: Indexes;
     key: K;
@@ -72,6 +92,11 @@ export interface DistributedTableOptions<T, K extends TableKeyConfig<T> = TableK
     table?: ExternalTableRef;
     ttl?: keyof T & string;
 }
+
+// @public
+export type ExactCounters<T, K extends TableKeyConfig<T>, C> = C & {
+    [P in Exclude<keyof C, CounterField<T, K>>]: never;
+};
 
 // @public
 export interface ExternalKmsKeyRef {
@@ -90,6 +115,11 @@ export interface ExternalTableRef {
 }
 
 // @public
+export interface IncrementOptions {
+    by?: number;
+}
+
+// @public
 export type KeyCondition<T, K extends TableKeyConfig<T>> = K extends {
     sortKey: infer SK extends keyof T & string;
 } ? {
@@ -99,6 +129,11 @@ export type KeyCondition<T, K extends TableKeyConfig<T>> = K extends {
 } : {
     [P in K['partitionKey']]: PartitionKeyCondition<T[P]>;
 };
+
+// @public
+export type NumericFields<T> = {
+    [P in keyof T & string]-?: NonNullable<T[P]> extends number ? P : never;
+}[keyof T & string];
 
 // @public
 export type PartitionKeyCondition<V> = {

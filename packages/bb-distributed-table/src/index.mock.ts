@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { BB_NAME, BB_VERSION } from './version.js';
 
 export { DistributedTableErrors } from './errors.js';
+import type { ResolvedCounterBounds } from './errors.js';
 export type {
 	TableKeyConfig,
 	DistributedTableOptions,
@@ -24,6 +25,12 @@ export type {
 	ScanOptions,
 	PutOptions,
 	DeleteOptions,
+	NumericFields,
+	CounterField,
+	CounterBounds,
+	CountersConfig,
+	ExactCounters,
+	IncrementOptions,
 } from './types.js';
 
 import type {
@@ -37,8 +44,11 @@ import type {
 	DeleteOptions,
 	TableKey,
 	ReadValidationMode,
+	CountersConfig,
+	CounterField,
+	IncrementOptions,
 } from './types.js';
-import { DistributedTableErrors, DistributedTableMessages, blocksError, conditionalCheckFailed, normalizeSortKeyCondition, applyReadValidation } from './errors.js';
+import { DistributedTableErrors, DistributedTableMessages, blocksError, conditionalCheckFailed, normalizeSortKeyCondition, resolveCountersConfig, resolveIncrement, itemNotFound, counterOutOfRange, applyReadValidation } from './errors.js';
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -123,6 +133,7 @@ export class DistributedTable<
 	T,
 	K extends TableKeyConfig<T> = TableKeyConfig<T>,
 	Indexes extends Record<string, TableKeyConfig<T>> = Record<string, TableKeyConfig<T>>,
+	C extends CountersConfig<T, K> = Record<never, never>,
 > extends Scope {
 	private filePath: string;
 	private data: Map<string, T>;
@@ -130,11 +141,12 @@ export class DistributedTable<
 	private keyConfig: K;
 	private indexes: Indexes;
 	private readValidation: ReadValidationMode;
+	private counters: Map<string, ResolvedCounterBounds>;
 
 	/** @internal Logger for internal operations. Defaults to warn-level when not provided. */
 	protected log: ChildLogger;
 
-	constructor(scope: ScopeParent, id: string, public options: DistributedTableOptions<T, K, Indexes>) {
+	constructor(scope: ScopeParent, id: string, public options: DistributedTableOptions<T, K, Indexes, C>) {
 		super(id, { parent: scope, bbName: BB_NAME, bbVersion: BB_VERSION });
 		// Default level is 'warn' (not 'error') so the readValidation='coerce'
 		// raw-fallback warning actually surfaces — it's the only log the block
@@ -146,6 +158,7 @@ export class DistributedTable<
 		this.keyConfig = options.key;
 		this.indexes = (options.indexes ?? {}) as Indexes;
 		this.readValidation = options.readValidation ?? 'coerce';
+		this.counters = resolveCountersConfig(options.counters as any, [options.key.partitionKey, options.key.sortKey]);
 		registerSdkIdentifiers(this.fullId, { tableName: `mock-${this.fullId}`.substring(0, 255) });
 	}
 
@@ -204,6 +217,45 @@ export class DistributedTable<
 
 		this.data.delete(keyStr);
 		this.flushToDisk();
+	}
+
+	/**
+	 * Atomically add `by` (default `1`) to a counter field and return the new
+	 * value. Only fields declared in the `counters` option can be incremented.
+	 * A missing attribute on an existing item counts as `0`.
+	 *
+	 * Never creates an item, and never runs the schema: the counter's only
+	 * constraints are its declared bounds.
+	 *
+	 * @throws {DistributedTableErrors.ItemNotFound} If no item exists for `key` (404).
+	 * @throws {DistributedTableErrors.CounterOutOfRange} If the result would fall
+	 *   outside the declared `min` / `max` (or the safe-integer range) (409).
+	 * @throws {DistributedTableErrors.InvalidQuery} If `field` is not a declared
+	 *   counter or `by` is not a safe integer.
+	 */
+	async increment(
+		key: TableKey<T, K>,
+		field: keyof C & CounterField<T, K>,
+		options?: IncrementOptions,
+	): Promise<number> {
+		const { bounds, by } = resolveIncrement(this.counters, field, options?.by);
+		const keyStr = this.serializeKey(key);
+		const existing = this.data.get(keyStr);
+		if (!existing) throw itemNotFound();
+
+		const current = (existing as any)[field] ?? 0;
+		if (typeof current !== 'number') {
+			// Same failure DynamoDB raises for ADD on a non-number attribute.
+			const err = new Error('An operand in the update expression has an incorrect data type');
+			err.name = 'ValidationException';
+			throw err;
+		}
+		const next = current + by;
+		if (next < bounds.min || next > bounds.max) throw counterOutOfRange(field);
+
+		this.data.set(keyStr, { ...existing, [field]: next });
+		this.flushToDisk();
+		return next;
 	}
 
 	/**

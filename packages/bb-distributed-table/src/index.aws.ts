@@ -11,6 +11,7 @@ import {
 	ScanCommand,
 	BatchGetCommand,
 	BatchWriteCommand,
+	UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { Scope, registerSdkIdentifiers, getSdkIdentifiers, installClientUserAgent } from '@aws-blocks/core';
 import type { ScopeParent } from '@aws-blocks/core';
@@ -18,6 +19,7 @@ import type { StandardSchemaV1 } from '@standard-schema/spec';
 import { BB_NAME, BB_VERSION } from './version.js';
 
 export { DistributedTableErrors } from './errors.js';
+import type { ResolvedCounterBounds } from './errors.js';
 export type {
 	TableKeyConfig,
 	DistributedTableOptions,
@@ -32,6 +34,12 @@ export type {
 	ScanOptions,
 	PutOptions,
 	DeleteOptions,
+	NumericFields,
+	CounterField,
+	CounterBounds,
+	CountersConfig,
+	ExactCounters,
+	IncrementOptions,
 } from './types.js';
 
 import type {
@@ -46,8 +54,11 @@ import type {
 	SortKeyCondition,
 	TableKey,
 	ReadValidationMode,
+	CountersConfig,
+	CounterField,
+	IncrementOptions,
 } from './types.js';
-import { DistributedTableErrors, DistributedTableMessages, blocksError, conditionalCheckFailed, normalizeSortKeyCondition, remapItemTooLarge, applyReadValidation } from './errors.js';
+import { DistributedTableErrors, DistributedTableMessages, blocksError, conditionalCheckFailed, normalizeSortKeyCondition, resolveCountersConfig, resolveIncrement, itemNotFound, counterOutOfRange, remapItemTooLarge, applyReadValidation } from './errors.js';
 import type { KeyCondition, QueryOptions } from './types.js';
 import { Logger } from '@aws-blocks/bb-logger';
 import type { ChildLogger } from '@aws-blocks/bb-logger';
@@ -78,18 +89,20 @@ export class DistributedTable<
 	T,
 	K extends TableKeyConfig<T> = TableKeyConfig<T>,
 	Indexes extends Record<string, TableKeyConfig<T>> = Record<string, TableKeyConfig<T>>,
+	C extends CountersConfig<T, K> = Record<never, never>,
 > extends Scope {
 	readonly bbName = BB_NAME;
 	private schema: StandardSchemaV1<T>;
 	private keyConfig: K;
 	private indexes: Indexes;
 	private readValidation: ReadValidationMode;
+	private counters: Map<string, ResolvedCounterBounds>;
 	private docClient: DynamoDBDocumentClient;
 
 	/** @internal Logger for internal operations. Defaults to warn-level when not provided. */
 	protected log: ChildLogger;
 
-	constructor(scope: ScopeParent, id: string, public options: DistributedTableOptions<T, K, Indexes>) {
+	constructor(scope: ScopeParent, id: string, public options: DistributedTableOptions<T, K, Indexes, C>) {
 		super(id, { parent: scope, bbName: BB_NAME, bbVersion: BB_VERSION });
 		// Default level is 'warn' (not 'error') so the readValidation='coerce'
 		// raw-fallback warning actually surfaces — it's the only log the block
@@ -100,6 +113,7 @@ export class DistributedTable<
 		this.keyConfig = options.key;
 		this.indexes = (options.indexes ?? {}) as Indexes;
 		this.readValidation = options.readValidation ?? 'coerce';
+		this.counters = resolveCountersConfig(options.counters as any, [options.key.partitionKey, options.key.sortKey]);
 		const client = new DynamoDBClient({
 			customUserAgent: this.buildUserAgentChain(),
 		});
@@ -171,6 +185,81 @@ export class DistributedTable<
 			// NOT when `ifExists` is also set.
 			if (err instanceof Error && err.name === DistributedTableErrors.ConditionalCheckFailed) {
 				throw conditionalCheckFailed(options?.ifFieldEquals !== undefined && !options?.ifExists, err);
+			}
+			throw err;
+		}
+	}
+
+	/**
+	 * Atomically add `by` (default `1`) to a counter field with a single
+	 * DynamoDB `UpdateItem` (`ADD`) and return the new value. Only fields
+	 * declared in the `counters` option can be incremented. A missing attribute
+	 * on an existing item counts as `0`.
+	 *
+	 * Existence and the declared bounds are enforced in the same write by a
+	 * condition expression, so they hold under concurrent increments. Never
+	 * creates an item, and never runs the schema.
+	 *
+	 * @throws {DistributedTableErrors.ItemNotFound} If no item exists for `key` (404).
+	 * @throws {DistributedTableErrors.CounterOutOfRange} If the result would fall
+	 *   outside the declared `min` / `max` (or the safe-integer range) (409).
+	 * @throws {DistributedTableErrors.InvalidQuery} If `field` is not a declared
+	 *   counter or `by` is not a safe integer.
+	 */
+	async increment(
+		key: TableKey<T, K>,
+		field: keyof C & CounterField<T, K>,
+		options?: IncrementOptions,
+	): Promise<number> {
+		const { bounds, by } = resolveIncrement(this.counters, field, options?.by);
+
+		// new = old + by must land in [min, max], i.e. old in [min - by, max - by].
+		// Each side is dropped when it falls outside the safe-integer range: no
+		// value this API can store lies beyond it, and lib-dynamodb refuses to
+		// marshal unsafe numbers. A missing attribute is treated as 0 by ADD, so
+		// the attribute_not_exists branch is allowed only when 0 + by is in range.
+		const lo = bounds.min - by;
+		const hi = bounds.max - by;
+		const names: Record<string, string> = { '#pk': this.keyConfig.partitionKey, '#c': field };
+		const values: Record<string, any> = { ':by': by };
+		const range: string[] = [];
+		if (lo > Number.MIN_SAFE_INTEGER) { range.push('#c >= :lo'); values[':lo'] = lo; }
+		if (hi < Number.MAX_SAFE_INTEGER) { range.push('#c <= :hi'); values[':hi'] = hi; }
+		const present = range.length > 0 ? `(${range.join(' AND ')})` : 'attribute_exists(#c)';
+		const missingOk = lo <= 0 && 0 <= hi;
+		const counterCondition = missingOk
+			? (range.length > 0 ? `(attribute_not_exists(#c) OR ${present})` : undefined)
+			: `(attribute_exists(#c) AND ${present})`;
+
+		try {
+			const result = await this.docClient.send(new UpdateCommand({
+				TableName: getSdkIdentifiers(this).tableName,
+				Key: this.buildKey(key),
+				UpdateExpression: 'ADD #c :by',
+				ConditionExpression: counterCondition
+					? `attribute_exists(#pk) AND ${counterCondition}`
+					: 'attribute_exists(#pk)',
+				ExpressionAttributeNames: names,
+				ExpressionAttributeValues: values,
+				ReturnValues: 'UPDATED_NEW',
+				ReturnValuesOnConditionCheckFailure: 'ALL_OLD',
+			}));
+			return result.Attributes?.[field] as number;
+		} catch (err: unknown) {
+			if (err instanceof Error && err.name === DistributedTableErrors.ConditionalCheckFailed) {
+				// DynamoDB reports one exception for every failed condition; the
+				// returned old item tells the cases apart. No item → not found.
+				// A non-number counter fails the range comparison, but ADD on it
+				// would be a type error, so report it as DynamoDB (and the mock) do.
+				const old = (err as { Item?: Record<string, any> }).Item;
+				if (!old) throw itemNotFound(err);
+				const attr = old[field];
+				if (attr !== undefined && attr.N === undefined) {
+					const typeErr = new Error('An operand in the update expression has an incorrect data type', { cause: err });
+					typeErr.name = 'ValidationException';
+					throw typeErr;
+				}
+				throw counterOutOfRange(field, err);
 			}
 			throw err;
 		}

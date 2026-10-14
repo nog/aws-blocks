@@ -30,10 +30,56 @@ export interface TableKeyConfig<T> {
 	sortKey?: keyof T & string;
 }
 
+// ── Counters ────────────────────────────────────────────────────────────────
+
+/** Fields of T whose (non-nullable) type is `number`. */
+export type NumericFields<T> = {
+	[P in keyof T & string]-?: NonNullable<T[P]> extends number ? P : never;
+}[keyof T & string];
+
+/**
+ * Fields that may be declared as counters: numeric and not part of the primary
+ * key (DynamoDB does not allow updating key attributes).
+ */
+export type CounterField<T, K extends TableKeyConfig<T>> = Exclude<
+	NumericFields<T>,
+	K['partitionKey'] | (K extends { sortKey: infer SK } ? SK : never)
+>;
+
+/** Inclusive bounds enforced atomically by {@link DistributedTable.increment}. */
+export interface CounterBounds {
+	/** Inclusive lower bound. Must be a safe integer. */
+	min?: number;
+	/** Inclusive upper bound. Must be a safe integer. */
+	max?: number;
+}
+
+/** Shape of the `counters` option: counter field name → bounds. */
+export type CountersConfig<T, K extends TableKeyConfig<T>> = {
+	[P in CounterField<T, K>]?: CounterBounds;
+};
+
+/**
+ * Rejects keys in `C` that are not valid counter fields (typos, non-numeric
+ * fields, key attributes). Without this, a config such as
+ * `{ likeCount: {}, likeCont: {} }` would type-check because excess-property
+ * checks don't apply to an inferred generic.
+ */
+export type ExactCounters<T, K extends TableKeyConfig<T>, C> = C & {
+	[P in Exclude<keyof C, CounterField<T, K>>]: never;
+};
+
+/** Options for {@link DistributedTable.increment}. */
+export interface IncrementOptions {
+	/** Amount to add. May be negative. Must be a safe integer. Defaults to `1`. */
+	by?: number;
+}
+
 export interface DistributedTableOptions<
 	T,
 	K extends TableKeyConfig<T> = TableKeyConfig<T>,
 	Indexes extends Record<string, TableKeyConfig<T>> = Record<string, TableKeyConfig<T>>,
+	C extends CountersConfig<T, K> = Record<never, never>,
 > {
 	/** StandardSchemaV1 schema for runtime validation and type inference. Required. */
 	schema: StandardSchemaV1<T>;
@@ -41,6 +87,33 @@ export interface DistributedTableOptions<
 	key: K;
 	/** Global secondary index definitions. Optional. */
 	indexes?: Indexes;
+	/**
+	 * Numeric fields that can be updated with {@link DistributedTable.increment},
+	 * with optional inclusive `min` / `max` bounds. Only fields named here can be
+	 * incremented; this is checked at compile time and at runtime.
+	 *
+	 * Bounds are enforced atomically inside the single DynamoDB `UpdateItem`
+	 * call (a condition expression), so they hold under concurrent increments.
+	 * They are **not** enforced on `put` / `putBatch`; those still validate
+	 * against `schema` only. A counter field should therefore carry no schema
+	 * constraints other than its type — `increment` writes the new value without
+	 * running it through the schema.
+	 *
+	 * Note: a `put` of a full item overwrites any increment that landed after the
+	 * item was read. Use `ifFieldEquals` when you `put` an item that has counters.
+	 *
+	 * @example
+	 * ```typescript
+	 * const posts = new DistributedTable(scope, 'posts', {
+	 *   schema: postSchema,
+	 *   key: { partitionKey: 'id' },
+	 *   counters: { likeCount: { min: 0 }, viewCount: {} },
+	 * });
+	 * await posts.increment({ id: 'p1' }, 'likeCount');            // +1
+	 * await posts.increment({ id: 'p1' }, 'likeCount', { by: -1 }); // -1, fails below 0
+	 * ```
+	 */
+	counters?: ExactCounters<T, K, C>;
 	/**
 	 * Enable DynamoDB Time-to-Live (TTL) on the specified attribute.
 	 * The attribute must be a field in the schema and should contain a Unix

@@ -88,7 +88,100 @@ export const DistributedTableErrors = {
 	 * constant is shared purely so catch-site handling is identical across both.
 	 */
 	BatchIncomplete: 'BatchIncompleteException',
+	/**
+	 * `increment()` was called for a key with no stored item. `increment` never
+	 * creates an item: a partial item holding only the key and the counter would
+	 * not satisfy the schema. Maps to HTTP 404. Catchable via
+	 * `isBlocksError(e, DistributedTableErrors.ItemNotFound)`.
+	 */
+	ItemNotFound: 'ItemNotFoundException',
+	/**
+	 * `increment()` would move a counter outside its declared `min` / `max`
+	 * bounds (or outside the safe-integer range). Nothing is written. Maps to
+	 * HTTP 409, not retriable: retrying the same increment fails the same way
+	 * until the stored value changes. Catchable via
+	 * `isBlocksError(e, DistributedTableErrors.CounterOutOfRange)`.
+	 */
+	CounterOutOfRange: 'CounterOutOfRangeException',
 } as const;
+
+/** @internal 404 for `increment()` on a missing item. Shared by mock and AWS. */
+export function itemNotFound(cause?: unknown): ApiError {
+	return new ApiError('No item exists for the given key', 404, {
+		name: DistributedTableErrors.ItemNotFound,
+		cause,
+		retriable: false,
+	});
+}
+
+/** @internal 409 for `increment()` past a counter bound. Shared by mock and AWS. */
+export function counterOutOfRange(field: string, cause?: unknown): ApiError {
+	return new ApiError(DistributedTableMessages.counterOutOfRange(field), 409, {
+		name: DistributedTableErrors.CounterOutOfRange,
+		cause,
+		retriable: false,
+	});
+}
+
+/** @internal Effective inclusive bounds for one counter (declared ∩ safe-integer range). */
+export interface ResolvedCounterBounds {
+	min: number;
+	max: number;
+}
+
+/**
+ * @internal Validate the `counters` option at construction time and resolve each
+ * field's effective bounds. Declared bounds are intersected with the safe-integer
+ * range so an `increment` can never produce a value that `lib-dynamodb` refuses
+ * to unmarshal. Shared by mock and AWS so both reject the same configs.
+ *
+ * @throws {Error} If a field is a key attribute, or a bound is not a safe
+ *   integer, or `min > max`.
+ */
+export function resolveCountersConfig(
+	counters: Record<string, { min?: number; max?: number } | undefined> | undefined,
+	keyFields: (string | undefined)[],
+): Map<string, ResolvedCounterBounds> {
+	const resolved = new Map<string, ResolvedCounterBounds>();
+	for (const [field, bounds] of Object.entries(counters ?? {})) {
+		if (keyFields.includes(field)) {
+			throw new Error(DistributedTableMessages.counterIsKey(field));
+		}
+		const min = bounds?.min ?? Number.MIN_SAFE_INTEGER;
+		const max = bounds?.max ?? Number.MAX_SAFE_INTEGER;
+		if (!Number.isSafeInteger(min) || !Number.isSafeInteger(max)) {
+			throw new Error(DistributedTableMessages.counterBoundNotInteger(field));
+		}
+		if (min > max) {
+			throw new Error(DistributedTableMessages.counterMinAboveMax(field, min, max));
+		}
+		resolved.set(field, { min, max });
+	}
+	return resolved;
+}
+
+/**
+ * @internal Validate an `increment()` call before it reaches storage: the field
+ * must be a declared counter and `by` a safe integer. Returns the field's bounds
+ * and the resolved delta. Shared by mock and AWS.
+ *
+ * @throws {DistributedTableErrors.InvalidQuery} On an undeclared field or a bad `by`.
+ */
+export function resolveIncrement(
+	counters: Map<string, ResolvedCounterBounds>,
+	field: string,
+	by: number | undefined,
+): { bounds: ResolvedCounterBounds; by: number } {
+	const bounds = counters.get(field);
+	if (!bounds) {
+		throw blocksError(DistributedTableErrors.InvalidQuery, DistributedTableMessages.notACounter(field, [...counters.keys()]));
+	}
+	const delta = by ?? 1;
+	if (!Number.isSafeInteger(delta)) {
+		throw blocksError(DistributedTableErrors.InvalidQuery, DistributedTableMessages.incrementByNotInteger(delta));
+	}
+	return { bounds, by: delta };
+}
 
 /**
  * @internal Build an Error whose `name` carries the typed error code (so callers
@@ -174,6 +267,17 @@ export const DistributedTableMessages = {
 	batchIncomplete: (operation: string, remaining: number, attempts: number) =>
 		`${operation} did not complete: ${remaining} entr${remaining === 1 ? 'y' : 'ies'} still unprocessed ` +
 		`after ${attempts} attempts (DynamoDB throttling or response-size limits). Retry with backoff.`,
+	notACounter: (field: string, declared: string[]) =>
+		`increment() field '${field}' is not declared in the 'counters' option` +
+		(declared.length > 0 ? ` (declared: ${declared.join(', ')})` : ' (no counters are declared)'),
+	incrementByNotInteger: (by: number) => `increment() 'by' must be a safe integer (got ${by})`,
+	counterOutOfRange: (field: string) =>
+		`increment() would move counter '${field}' outside its allowed range`,
+	counterIsKey: (field: string) =>
+		`counters: '${field}' is a key attribute and cannot be a counter (key attributes cannot be updated)`,
+	counterBoundNotInteger: (field: string) => `counters: bounds for '${field}' must be safe integers`,
+	counterMinAboveMax: (field: string, min: number, max: number) =>
+		`counters: '${field}' has min (${min}) greater than max (${max})`,
 } as const;
 
 /**

@@ -26,6 +26,7 @@ const table = new DistributedTable(scope, id, options)
 | `getBatch(keys)` | `Promise<(T \| null)[]>` | Retrieve multiple items by key. |
 | `putBatch(items)` | `Promise<void>` | Store multiple items. |
 | `deleteBatch(keys)` | `Promise<void>` | Remove multiple items by key. |
+| `increment(key, field, options?)` | `Promise<number>` | Atomically add to a field declared in `counters` and return the new value. See [Counters](#counters). |
 | `DistributedTable.fromExisting(tableName)` | `ExternalTableRef` | Wrap a pre-existing DynamoDB table. |
 
 **Runtime only.** Data methods (`get`, `put`, `delete`, `query`, `scan`, `getBatch`, `putBatch`, `deleteBatch`) run at request time — call them inside an `ApiNamespace` method, `RawRoute` handler, job handler, or a runtime script, **not** at the top level of your `aws-blocks/index.ts`. Top-level code runs during CDK synth, where the block resolves to its infrastructure construct (no data methods), so a top-level call throws `table.<method> is not a function` (throws `TypeError` at runtime if called during CDK synth). To seed data, do it from inside a handler or a separate runtime script. Constructing the block at module scope is fine; only method calls must move into handlers.
@@ -45,6 +46,7 @@ const table = new DistributedTable(scope, id, options)
 | `encryption` | `'aws-managed' \| 'customer-managed' \| ExternalKmsKeyRef` | No | At-rest encryption key. `'aws-managed'` (default) uses the `aws/dynamodb` KMS key (auditable, no key charge); `'customer-managed'` provisions a dedicated CMK; pass `DistributedTable.fromKmsKey(arn)` to encrypt with an existing CMK you own (shareable across tables). |
 | `readValidation` | `'off' \| 'coerce' \| 'strict'` | No | How reads (`get`/`getBatch`/`query`/`scan`) reconcile a stored item with `schema`. `'coerce'` (**default**) returns the coerced value and, on failure, the raw value + a warning (never throws); `'strict'` throws `ValidationFailed` on a non-conforming item; `'off'` returns the raw value with no validation. See [Reads and schema evolution](#reads-and-schema-evolution). |
 | `table` | `ExternalTableRef` | No | Wrap an existing DynamoDB table instead of creating one. Durability/encryption options are ignored — the customer owns the table's configuration. |
+| `counters` | `{ [field]: { min?, max? } }` | No | Numeric fields that `increment()` may update, with optional inclusive bounds enforced atomically. Only fields named here can be incremented. See [Counters](#counters). |
 | `logger` | `ChildLogger` | No | Optional logger for internal operations. When omitted, a default Logger at error level is created. |
 
 ### Key Object Pattern
@@ -131,7 +133,29 @@ await table.delete(key, { ifFieldEquals: { status: 'archived' } });
 
 All condition failures throw with `error.name === DistributedTableErrors.ConditionalCheckFailed`. They serialize to JSON-RPC **409 (Conflict)** over the wire (not 500), in both the mock and AWS runtime. Only `ifFieldEquals` optimistic-lock conflicts are flagged retriable; `ifNotExists` / `ifExists` existence assertions are **not** retriable (a blind retry fails identically).
 
-> **No partial update:** There is no `update()` or `patch()` method. To change a field, do a read-modify-write — `get()` the item, mutate it, then `put()` the full item back. For safe concurrent updates, pass `{ ifFieldEquals: { version: <previous> } }` to `put()` so the write fails (via `ConditionalCheckFailed`) if another writer changed the item in the meantime (optimistic locking).
+> **No partial update:** There is no `update()` or `patch()` method (apart from `increment()` for [counters](#counters)). To change a field, do a read-modify-write — `get()` the item, mutate it, then `put()` the full item back. For safe concurrent updates, pass `{ ifFieldEquals: { version: <previous> } }` to `put()` so the write fails (via `ConditionalCheckFailed`) if another writer changed the item in the meantime (optimistic locking).
+
+### Counters
+
+`increment()` adds to a numeric field in a single atomic write (DynamoDB `ADD`), with no read-modify-write and no retry loop, so concurrent increments on the same item never conflict or get lost. Declare the fields it may touch, and optional inclusive bounds, with the `counters` option:
+
+```typescript
+const posts = new DistributedTable(scope, 'posts', {
+  schema: z.object({ id: z.string(), title: z.string(), likeCount: z.number(), viewCount: z.number().optional() }),
+  key: { partitionKey: 'id' },
+  counters: { likeCount: { min: 0 }, viewCount: {} },
+});
+
+await posts.increment({ id: 'p1' }, 'likeCount');             // → new value
+await posts.increment({ id: 'p1' }, 'likeCount', { by: -1 }); // throws CounterOutOfRange below 0
+```
+
+- **Typed:** `field` only accepts fields declared in `counters`, and `counters` only accepts numeric, non-key fields of the schema (typos are compile errors).
+- **Bounds are atomic:** `min` / `max` are checked in the same write, so they hold under concurrency (100 parallel `+1`s against `max: 50` succeed exactly up to 50). Values also stay within `Number.MIN_SAFE_INTEGER`..`MAX_SAFE_INTEGER`. `by` must be a safe integer (default `1`).
+- **Never creates an item:** incrementing a missing item throws `ItemNotFound` (404); `put` the item first. A missing *attribute* on an existing item counts as `0`.
+- **Bypasses `schema`:** the new value is written without running the schema, so give counter fields no schema constraints beyond their type; express ranges with `min` / `max`. Bounds are not checked by `put`.
+
+> **`put` can overwrite increments.** `put` writes the whole item, so an increment that lands between your `get()` and `put()` is lost. When you `put` an item that has counters, pass `ifFieldEquals` (e.g. on a `version` field) so the write fails instead.
 
 ### Reads and schema evolution
 
@@ -180,8 +204,10 @@ Errors thrown by DistributedTable carry an `error.name` you can match with `isBl
 |----------|--------------|-------------|
 | `DistributedTableErrors.ConditionalCheckFailed` | `ConditionalCheckFailedException` | An `ifNotExists` / `ifExists` / `ifFieldEquals` condition failed. Serializes to HTTP **409 (Conflict)**; retriable only for `ifFieldEquals` optimistic-lock conflicts (not `ifNotExists` / `ifExists`). |
 | `DistributedTableErrors.ValidationFailed` | `ValidationFailedException` | An item failed the configured `schema` validation on `put()` / `putBatch()`. |
-| `DistributedTableErrors.InvalidQuery` | `InvalidQueryException` | The query/condition shape is wrong: missing `where`, partition key not given as `{ equals }`, unknown index, multiple sort-key conditions, or an empty `ifFieldEquals`. A caller bug. |
+| `DistributedTableErrors.InvalidQuery` | `InvalidQueryException` | The query/condition shape is wrong: missing `where`, partition key not given as `{ equals }`, unknown index, multiple sort-key conditions, an empty `ifFieldEquals`, or an `increment()` on an undeclared field or with a non-integer `by`. A caller bug. |
 | `DistributedTableErrors.ItemTooLarge` | `ItemTooLargeException` | A `put`/`putBatch` item exceeds DynamoDB's 400 KB per-item size limit. |
+| `DistributedTableErrors.ItemNotFound` | `ItemNotFoundException` | `increment()` targeted a key with no stored item. Serializes to HTTP **404**. |
+| `DistributedTableErrors.CounterOutOfRange` | `CounterOutOfRangeException` | `increment()` would move a counter outside its `min` / `max` (or the safe-integer range). Nothing is written. HTTP **409**, not retriable. |
 | `DistributedTableErrors.BatchIncomplete` | `BatchIncompleteException` | A batch op left entries unprocessed after the retry budget (sustained throttling). AWS runtime only. |
 
 ```typescript
